@@ -41,6 +41,11 @@ func NewApp() *cli.App {
 			Usage: "specify the directory containing migration files",
 		},
 		cli.StringFlag{
+			Name:  "seeds-dir, f",
+			Value: dbmate.DefaultSeedsDir,
+			Usage: "specify the directory containing seed files",
+		},
+		cli.StringFlag{
 			Name:  "schema-file, s",
 			Value: dbmate.DefaultSchemaFile,
 			Usage: "specify the schema file location",
@@ -62,10 +67,26 @@ func NewApp() *cli.App {
 			}),
 		},
 		{
+			Name:    "new-seed",
+			Aliases: []string{"ns"},
+			Usage:   "Generate a new seed file",
+			Action: action(func(db *dbmate.DB, c *cli.Context) error {
+				name := c.Args().First()
+				return db.NewSeed(name)
+			}),
+		},
+		{
 			Name:  "up",
 			Usage: "Create database (if necessary) and migrate to the latest version",
 			Action: action(func(db *dbmate.DB, c *cli.Context) error {
 				return db.CreateAndMigrate()
+			}),
+		},
+		{
+			Name:  "up-seed",
+			Usage: "Create database (if necessary) and runs to the latest version seed",
+			Action: action(func(db *dbmate.DB, c *cli.Context) error {
+				return db.CreateAndSeed()
 			}),
 		},
 		{
@@ -90,11 +111,26 @@ func NewApp() *cli.App {
 			}),
 		},
 		{
+			Name:  "seed",
+			Usage: "Run unsed seed .sql scripts",
+			Action: action(func(db *dbmate.DB, c *cli.Context) error {
+				return db.Seed()
+			}),
+		},
+		{
 			Name:    "rollback",
 			Aliases: []string{"down"},
 			Usage:   "Rollback the most recent migration",
 			Action: action(func(db *dbmate.DB, c *cli.Context) error {
 				return db.Rollback()
+			}),
+		},
+		{
+			Name:    "rollback-seed",
+			Aliases: []string{"down-seed"},
+			Usage:   "Rollback the most recent migration",
+			Action: action(func(db *dbmate.DB, c *cli.Context) error {
+				return db.RollbackSeed()
 			}),
 		},
 		{

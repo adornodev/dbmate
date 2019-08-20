@@ -87,6 +87,27 @@ func postgresSchemaMigrationsDump(db *sql.DB) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func postgresSchemaSeedsDump(db *sql.DB) ([]byte, error) {
+	// load applied seeds
+	seeds, err := queryColumn(db,
+		"select quote_literal(version) from public.schema_seeds order by version asc")
+	if err != nil {
+		return nil, err
+	}
+
+	// build schema_seeds table data
+	var buf bytes.Buffer
+	buf.WriteString("\n--\n-- Dbmate schema seeds\n--\n\n")
+
+	if len(seeds) > 0 {
+		buf.WriteString("INSERT INTO public.schema_seeds (version) VALUES\n    (" +
+			strings.Join(seeds, "),\n    (") +
+			");\n")
+	}
+
+	return buf.Bytes(), nil
+}
+
 // DumpSchema returns the current database schema
 func (drv PostgresDriver) DumpSchema(u *url.URL, db *sql.DB) ([]byte, error) {
 	// load schema
@@ -133,6 +154,14 @@ func (drv PostgresDriver) CreateMigrationsTable(db *sql.DB) error {
 	return err
 }
 
+// CreateSeedsTable creates the schema_seeds table
+func (drv PostgresDriver) CreateSeedsTable(db *sql.DB) error {
+	_, err := db.Exec("create table if not exists public.schema_seeds " +
+		"(version varchar(255) primary key)")
+
+	return err
+}
+
 // SelectMigrations returns a list of applied migrations
 // with an optional limit (in descending order)
 func (drv PostgresDriver) SelectMigrations(db *sql.DB, limit int) (map[string]bool, error) {
@@ -160,9 +189,50 @@ func (drv PostgresDriver) SelectMigrations(db *sql.DB, limit int) (map[string]bo
 	return migrations, nil
 }
 
+// SelectMigrations returns a list of applied migrations
+// with an optional limit (in descending order)
+func (drv PostgresDriver) SelectSeeds(db *sql.DB, limit int) (map[string]bool, error) {
+	query := "select version from public.schema_seeds order by version desc"
+	if limit >= 0 {
+		query = fmt.Sprintf("%s limit %d", query, limit)
+	}
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+
+	defer mustClose(rows)
+
+	seeds := map[string]bool{}
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return nil, err
+		}
+
+		seeds[version] = true
+	}
+
+	return seeds, nil
+}
+
 // InsertMigration adds a new migration record
 func (drv PostgresDriver) InsertMigration(db Transaction, version string) error {
 	_, err := db.Exec("insert into public.schema_migrations (version) values ($1)", version)
+
+	return err
+}
+
+// InsertSeed adds a new migration record
+func (drv PostgresDriver) InsertSeed(db Transaction, version string) error {
+	_, err := db.Exec("insert into public.schema_seeds (version) values ($1)", version)
+
+	return err
+}
+
+// DeleteSeed removes a seed record
+func (drv PostgresDriver) DeleteSeed(db Transaction, version string) error {
+	_, err := db.Exec("delete from public.schema_seeds where version = $1", version)
 
 	return err
 }

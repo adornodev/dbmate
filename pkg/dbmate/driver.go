@@ -14,9 +14,13 @@ type Driver interface {
 	DropDatabase(*url.URL) error
 	DumpSchema(*url.URL, *sql.DB) ([]byte, error)
 	CreateMigrationsTable(*sql.DB) error
+	CreateSeedsTable(*sql.DB) error
 	SelectMigrations(*sql.DB, int) (map[string]bool, error)
+	SelectSeeds(*sql.DB, int) (map[string]bool, error)
 	InsertMigration(Transaction, string) error
+	InsertSeed(Transaction, string) error
 	DeleteMigration(Transaction, string) error
+	DeleteSeed(Transaction, string) error
 	Ping(*url.URL) error
 }
 

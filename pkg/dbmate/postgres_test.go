@@ -166,6 +166,29 @@ func TestPostgresCreateMigrationsTable(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestPostgresCreateSeedsTable(t *testing.T) {
+	drv := PostgresDriver{}
+	db := prepTestPostgresDB(t)
+	defer mustClose(db)
+
+	// seeds table should not exist
+	count := 0
+	err := db.QueryRow("select count(*) from public.schema_seeds").Scan(&count)
+	require.Equal(t, "pq: relation \"public.schema_seeds\" does not exist", err.Error())
+
+	// create table
+	err = drv.CreateSeedsTable(db)
+	require.NoError(t, err)
+
+	// seeds table should exist
+	err = db.QueryRow("select count(*) from public.schema_seeds").Scan(&count)
+	require.NoError(t, err)
+
+	// create table should be idempotent
+	err = drv.CreateSeedsTable(db)
+	require.NoError(t, err)
+}
+
 func TestPostgresSelectMigrations(t *testing.T) {
 	drv := PostgresDriver{}
 	db := prepTestPostgresDB(t)
@@ -192,6 +215,32 @@ func TestPostgresSelectMigrations(t *testing.T) {
 	require.Equal(t, false, migrations["abc2"])
 }
 
+func TestPostgresSelectSeeds(t *testing.T) {
+	drv := PostgresDriver{}
+	db := prepTestPostgresDB(t)
+	defer mustClose(db)
+
+	err := drv.CreateSeedsTable(db)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`insert into public.schema_seeds (version)
+		values ('abc2'), ('abc1'), ('abc3')`)
+	require.NoError(t, err)
+
+	seeds, err := drv.SelectSeeds(db, -1)
+	require.NoError(t, err)
+	require.Equal(t, true, seeds["abc1"])
+	require.Equal(t, true, seeds["abc2"])
+	require.Equal(t, true, seeds["abc2"])
+
+	// test limit param
+	seeds, err = drv.SelectSeeds(db, 1)
+	require.NoError(t, err)
+	require.Equal(t, true, seeds["abc3"])
+	require.Equal(t, false, seeds["abc1"])
+	require.Equal(t, false, seeds["abc2"])
+}
+
 func TestPostgresInsertMigration(t *testing.T) {
 	drv := PostgresDriver{}
 	db := prepTestPostgresDB(t)
@@ -215,6 +264,29 @@ func TestPostgresInsertMigration(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
+func TestPostgresInsertSeed(t *testing.T) {
+	drv := PostgresDriver{}
+	db := prepTestPostgresDB(t)
+	defer mustClose(db)
+
+	err := drv.CreateSeedsTable(db)
+	require.NoError(t, err)
+
+	count := 0
+	err = db.QueryRow("select count(*) from public.schema_seeds").Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 0, count)
+
+	// insert seed
+	err = drv.InsertSeed(db, "abc1")
+	require.NoError(t, err)
+
+	err = db.QueryRow("select count(*) from public.schema_seeds where version = 'abc1'").
+		Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+}
+
 func TestPostgresDeleteMigration(t *testing.T) {
 	drv := PostgresDriver{}
 	db := prepTestPostgresDB(t)
@@ -232,6 +304,27 @@ func TestPostgresDeleteMigration(t *testing.T) {
 
 	count := 0
 	err = db.QueryRow("select count(*) from public.schema_migrations").Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+}
+
+func TestPostgresDeleteSeed(t *testing.T) {
+	drv := PostgresDriver{}
+	db := prepTestPostgresDB(t)
+	defer mustClose(db)
+
+	err := drv.CreateSeedsTable(db)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`insert into public.schema_seeds (version)
+		values ('abc1'), ('abc2')`)
+	require.NoError(t, err)
+
+	err = drv.DeleteSeed(db, "abc2")
+	require.NoError(t, err)
+
+	count := 0
+	err = db.QueryRow("select count(*) from public.schema_seeds").Scan(&count)
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
 }

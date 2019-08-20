@@ -15,6 +15,9 @@ import (
 // DefaultMigrationsDir specifies default directory to find migration files
 const DefaultMigrationsDir = "./db/migrations"
 
+// DefaultSeedsDir specifies specifies default directory to find seeds files
+const DefaultSeedsDir = "./db/seeds"
+
 // DefaultSchemaFile specifies default location for schema.sql
 const DefaultSchemaFile = "./db/schema.sql"
 
@@ -29,6 +32,7 @@ type DB struct {
 	AutoDumpSchema bool
 	DatabaseURL    *url.URL
 	MigrationsDir  string
+	SeedsDir	   string
 	SchemaFile     string
 	WaitInterval   time.Duration
 	WaitTimeout    time.Duration
@@ -40,6 +44,7 @@ func New(databaseURL *url.URL) *DB {
 		AutoDumpSchema: true,
 		DatabaseURL:    databaseURL,
 		MigrationsDir:  DefaultMigrationsDir,
+		SeedsDir:       DefaultSeedsDir,
 		SchemaFile:     DefaultSchemaFile,
 		WaitInterval:   DefaultWaitInterval,
 		WaitTimeout:    DefaultWaitTimeout,
@@ -106,6 +111,28 @@ func (db *DB) CreateAndMigrate() error {
 	return db.Migrate()
 }
 
+// CreateAndSeed creates the database (if necessary) and runs seeds
+func (db *DB) CreateAndSeed() error {
+	drv, err := db.GetDriver()
+	if err != nil {
+		return err
+	}
+
+	// create database if it does not already exist
+	// skip this step if we cannot determine status
+	// (e.g. user does not have list database permission)
+	exists, err := drv.DatabaseExists(db.DatabaseURL)
+	if err == nil && !exists {
+		if err := drv.CreateDatabase(db.DatabaseURL); err != nil {
+			return err
+		}
+	}
+
+	// migrate
+	return db.Seed()
+}
+
+
 // Create creates the current database
 func (db *DB) Create() error {
 	drv, err := db.GetDriver()
@@ -150,7 +177,9 @@ func (db *DB) DumpSchema() error {
 	return ioutil.WriteFile(db.SchemaFile, schema, 0644)
 }
 
+
 const migrationTemplate = "-- migrate:up\n\n\n-- migrate:down\n\n"
+const seedTemplate = "-- seed:up\n\n\n-- seed:down\n\n"
 
 // NewMigration creates a new migration file
 func (db *DB) NewMigration(name string) error {
@@ -182,6 +211,39 @@ func (db *DB) NewMigration(name string) error {
 
 	defer mustClose(file)
 	_, err = file.WriteString(migrationTemplate)
+	return err
+}
+
+// NewSeed creates a new seed file
+func (db *DB) NewSeed(name string) error {
+	// new seed name
+	timestamp := time.Now().UTC().Format("20060102150405")
+	if name == "" {
+		return fmt.Errorf("please specify a name for the new seed")
+	}
+	name = fmt.Sprintf("%s_%s.sql", timestamp, name)
+
+	// create seeds dir if missing
+	if err := ensureDir(db.SeedsDir); err != nil {
+		return err
+	}
+
+	// check file does not already exist
+	path := filepath.Join(db.SeedsDir, name)
+	fmt.Printf("Creating seed: %s\n", path)
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		return fmt.Errorf("file already exists")
+	}
+
+	// write new seed
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+
+	defer mustClose(file)
+	_, err = file.WriteString(seedTemplate)
 	return err
 }
 
@@ -221,7 +283,96 @@ func (db *DB) openDatabaseForMigration() (Driver, *sql.DB, error) {
 	return drv, sqlDB, nil
 }
 
-// Migrate migrates database to the latest version
+func (db *DB) openDatabaseForSeed() (Driver, *sql.DB, error) {
+	drv, err := db.GetDriver()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sqlDB, err := drv.Open(db.DatabaseURL)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := drv.CreateSeedsTable(sqlDB); err != nil {
+		mustClose(sqlDB)
+		return nil, nil, err
+	}
+
+	return drv, sqlDB, nil
+}
+
+// Migrate seeds data to the latest version
+func (db *DB) Seed() error {
+	re := regexp.MustCompile(`^\d.*\.sql$`)
+	files, err := findSeedFiles(db.SeedsDir, re)
+	if err != nil {
+		return err
+	}
+
+	if len(files) == 0 {
+		return fmt.Errorf("no seed files found")
+	}
+
+	drv, sqlDB, err := db.openDatabaseForSeed()
+	if err != nil {
+		return err
+	}
+	defer mustClose(sqlDB)
+
+	applied, err := drv.SelectSeeds(sqlDB, -1)
+	if err != nil {
+		return err
+	}
+
+	for _, filename := range files {
+		ver := seedVersion(filename)
+		if ok := applied[ver]; ok {
+			// migration already applied
+			continue
+		}
+
+		fmt.Printf("Applying: %s\n", filename)
+
+		up, _, err := parseSeed(filepath.Join(db.SeedsDir, filename))
+		if err != nil {
+			return err
+		}
+
+		execSeed := func(tx Transaction) error {
+			// run actual migration
+			if _, err := tx.Exec(up.Contents); err != nil {
+				return err
+			}
+
+			// record seed
+			return drv.InsertSeed(tx, ver)
+		}
+
+		if up.Options.Transaction() {
+			// begin transaction
+			err = doTransaction(sqlDB, execSeed)
+		} else {
+			// run outside of transaction
+			err = execSeed(sqlDB)
+		}
+
+		if err != nil {
+			return err
+		}
+
+	}
+
+	// automatically update schema file, silence errors
+	/*
+	if db.AutoDumpSchema {
+		_ = db.DumpSchema()
+	}
+	*/
+
+	return nil
+}
+
 func (db *DB) Migrate() error {
 	re := regexp.MustCompile(`^\d.*\.sql$`)
 	files, err := findMigrationFiles(db.MigrationsDir, re)
@@ -315,6 +466,31 @@ func findMigrationFiles(dir string, re *regexp.Regexp) ([]string, error) {
 	return matches, nil
 }
 
+func findSeedFiles(dir string, re *regexp.Regexp) ([]string, error) {
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("could not find seeds directory `%s`", dir)
+	}
+
+	matches := []string{}
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		name := file.Name()
+		if !re.MatchString(name) {
+			continue
+		}
+
+		matches = append(matches, name)
+	}
+
+	sort.Strings(matches)
+
+	return matches, nil
+}
+
 func findMigrationFile(dir string, ver string) (string, error) {
 	if ver == "" {
 		panic("migration version is required")
@@ -335,7 +511,31 @@ func findMigrationFile(dir string, ver string) (string, error) {
 	return files[0], nil
 }
 
+func findSeedFile(dir string, ver string) (string, error) {
+	if ver == "" {
+		panic("seed version is required")
+	}
+
+	ver = regexp.QuoteMeta(ver)
+	re := regexp.MustCompile(fmt.Sprintf(`^%s.*\.sql$`, ver))
+
+	files, err := findSeedFiles(dir, re)
+	if err != nil {
+		return "", err
+	}
+
+	if len(files) == 0 {
+		return "", fmt.Errorf("can't find seed file: %s*.sql", ver)
+	}
+
+	return files[0], nil
+}
+
 func migrationVersion(filename string) string {
+	return regexp.MustCompile(`^\d+`).FindString(filename)
+}
+
+func seedVersion(filename string) string {
 	return regexp.MustCompile(`^\d+`).FindString(filename)
 }
 
@@ -389,6 +589,70 @@ func (db *DB) Rollback() error {
 	} else {
 		// run outside of transaction
 		err = execMigration(sqlDB)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	// automatically update schema file, silence errors
+	if db.AutoDumpSchema {
+		_ = db.DumpSchema()
+	}
+
+	return nil
+}
+
+// Rollback rolls back the most recent migration
+func (db *DB) RollbackSeed() error {
+	drv, sqlDB, err := db.openDatabaseForSeed()
+	if err != nil {
+		return err
+	}
+	defer mustClose(sqlDB)
+
+	applied, err := drv.SelectSeeds(sqlDB, 1)
+	if err != nil {
+		return err
+	}
+
+	// grab most recent applied seed (applied has len=1)
+	latest := ""
+	for ver := range applied {
+		latest = ver
+	}
+	if latest == "" {
+		return fmt.Errorf("can't rollback: no seeds have been applied")
+	}
+
+	filename, err := findSeedFile(db.SeedsDir, latest)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Rolling back: %s\n", filename)
+
+	_, down, err := parseSeed(filepath.Join(db.SeedsDir, filename))
+	if err != nil {
+		return err
+	}
+
+	execSeed := func(tx Transaction) error {
+		// rollback seed
+		if _, err := tx.Exec(down.Contents); err != nil {
+			return err
+		}
+
+		// remove seed record
+		return drv.DeleteSeed(tx, latest)
+	}
+
+	if down.Options.Transaction() {
+		// begin transaction
+		err = doTransaction(sqlDB, execSeed)
+	} else {
+		// run outside of transaction
+		err = execSeed(sqlDB)
 	}
 
 	if err != nil {

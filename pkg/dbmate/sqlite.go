@@ -124,6 +124,14 @@ func (drv SQLiteDriver) CreateMigrationsTable(db *sql.DB) error {
 	return err
 }
 
+// CreateSeedsTable creates the schema_seeds table
+func (drv SQLiteDriver) CreateSeedsTable(db *sql.DB) error {
+	_, err := db.Exec("create table if not exists schema_seeds " +
+		"(version varchar(255) primary key)")
+
+	return err
+}
+
 // SelectMigrations returns a list of applied migrations
 // with an optional limit (in descending order)
 func (drv SQLiteDriver) SelectMigrations(db *sql.DB, limit int) (map[string]bool, error) {
@@ -151,6 +159,33 @@ func (drv SQLiteDriver) SelectMigrations(db *sql.DB, limit int) (map[string]bool
 	return migrations, nil
 }
 
+// SelectSeeds returns a list of applied seeds
+// with an optional limit (in descending order)
+func (drv SQLiteDriver) SelectSeeds(db *sql.DB, limit int) (map[string]bool, error) {
+	query := "select version from schema_seeds order by version desc"
+	if limit >= 0 {
+		query = fmt.Sprintf("%s limit %d", query, limit)
+	}
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+
+	defer mustClose(rows)
+
+	seeds := map[string]bool{}
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return nil, err
+		}
+
+		seeds[version] = true
+	}
+
+	return seeds, nil
+}
+
 // InsertMigration adds a new migration record
 func (drv SQLiteDriver) InsertMigration(db Transaction, version string) error {
 	_, err := db.Exec("insert into schema_migrations (version) values (?)", version)
@@ -158,9 +193,23 @@ func (drv SQLiteDriver) InsertMigration(db Transaction, version string) error {
 	return err
 }
 
+// InsertSeed adds a new migration record
+func (drv SQLiteDriver) InsertSeed(db Transaction, version string) error {
+	_, err := db.Exec("insert into schema_seeds (version) values (?)", version)
+
+	return err
+}
+
 // DeleteMigration removes a migration record
 func (drv SQLiteDriver) DeleteMigration(db Transaction, version string) error {
 	_, err := db.Exec("delete from schema_migrations where version = ?", version)
+
+	return err
+}
+
+// DeleteSeed removes a seed record
+func (drv SQLiteDriver) DeleteSeed(db Transaction, version string) error {
+	_, err := db.Exec("delete from schema_seeds where version = ?", version)
 
 	return err
 }

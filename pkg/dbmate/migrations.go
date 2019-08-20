@@ -11,12 +11,19 @@ import (
 type MigrationOptions interface {
 	Transaction() bool
 }
+type SeedOptions interface {
+	Transaction() bool
+}
 
 type migrationOptions map[string]string
+type seedOptions map[string]string
 
 // Transaction returns whether or not this migration should run in a transaction
 // Defaults to true.
 func (m migrationOptions) Transaction() bool {
+	return m["transaction"] != "false"
+}
+func (m seedOptions) Transaction() bool {
 	return m["transaction"] != "false"
 }
 
@@ -26,9 +33,19 @@ type Migration struct {
 	Options  MigrationOptions
 }
 
+// Seed contains the seed contents and options
+type Seed struct {
+	Contents string
+	Options  SeedOptions
+}
+
 // NewMigration constructs a Migration object
 func NewMigration() Migration {
 	return Migration{Contents: "", Options: make(migrationOptions)}
+}
+
+func NewSeed() Seed {
+	return Seed{Contents: "", Options: make(seedOptions)}
 }
 
 // parseMigration reads a migration file and returns (up Migration, down Migration, error)
@@ -41,13 +58,26 @@ func parseMigration(path string) (Migration, Migration, error) {
 	return up, down, err
 }
 
-var upRegExp = regexp.MustCompile(`(?m)^--\s*migrate:up(\s*$|\s+\S+)`)
-var downRegExp = regexp.MustCompile(`(?m)^--\s*migrate:down(\s*$|\s+\S+)$`)
+// parseSeed reads a seed file and returns (up Seed, down Seed, error)
+func parseSeed(path string) (Seed, Seed, error) {
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		return NewSeed(), NewSeed(), err
+	}
+	up, down, err := parseSeedContents(string(data))
+	return up, down, err
+}
+
+var migrationUpRegExp = regexp.MustCompile(`(?m)^--\s*migrate:up(\s*$|\s+\S+)`)
+var migrationDownRegExp = regexp.MustCompile(`(?m)^--\s*migrate:down(\s*$|\s+\S+)$`)
+var seedUpRegExp = regexp.MustCompile(`(?m)^--\s*seed:up(\s*$|\s+\S+)`)
+var seedDownRegExp = regexp.MustCompile(`(?m)^--\s*seed:down(\s*$|\s+\S+)$`)
 var emptyLineRegExp = regexp.MustCompile(`^\s*$`)
 var commentLineRegExp = regexp.MustCompile(`^\s*--`)
 var whitespaceRegExp = regexp.MustCompile(`\s+`)
 var optionSeparatorRegExp = regexp.MustCompile(`:`)
-var blockDirectiveRegExp = regexp.MustCompile(`^--\s*migrate:[up|down]]`)
+var migrationBlockDirectiveRegExp = regexp.MustCompile(`^--\s*migrate:[up|down]]`)
+var seedBlockDirectiveRegExp = regexp.MustCompile(`^--\s*seed:[up|down]]`)
 
 // parseMigrationContents parses the string contents of a migration.
 // It will return two Migration objects, the first representing the "up"
@@ -58,13 +88,54 @@ func parseMigrationContents(contents string) (Migration, Migration, error) {
 	up := NewMigration()
 	down := NewMigration()
 
-	upDirectiveStart, upDirectiveEnd, hasDefinedUpBlock := getMatchPositions(contents, upRegExp)
-	downDirectiveStart, downDirectiveEnd, hasDefinedDownBlock := getMatchPositions(contents, downRegExp)
+	upDirectiveStart, upDirectiveEnd, hasDefinedUpBlock := getMatchPositions(contents, migrationUpRegExp)
+	downDirectiveStart, downDirectiveEnd, hasDefinedDownBlock := getMatchPositions(contents, migrationDownRegExp)
 
 	if !hasDefinedUpBlock {
 		return up, down, fmt.Errorf("dbmate requires each migration to define an up bock with '-- migrate:up'")
 	} else if statementsPrecedeMigrateBlocks(contents, upDirectiveStart, downDirectiveStart) {
 		return up, down, fmt.Errorf("dbmate does not support statements defined outside of the '-- migrate:up' or '-- migrate:down' blocks")
+	}
+
+	upEnd := len(contents)
+	downEnd := len(contents)
+
+	if hasDefinedDownBlock && upDirectiveStart < downDirectiveStart {
+		upEnd = downDirectiveStart
+	} else if hasDefinedDownBlock && upDirectiveStart > downDirectiveStart {
+		downEnd = upDirectiveStart
+	} else {
+		downEnd = -1
+	}
+
+	upDirective := substring(contents, upDirectiveStart, upDirectiveEnd)
+	downDirective := substring(contents, downDirectiveStart, downDirectiveEnd)
+
+	up.Options = parseMigrationOptions(upDirective)
+	up.Contents = substring(contents, upDirectiveStart, upEnd)
+
+	down.Options = parseMigrationOptions(downDirective)
+	down.Contents = substring(contents, downDirectiveStart, downEnd)
+
+	return up, down, nil
+}
+
+// parseSeedContents parses the string contents of a seed.
+// It will return two Seed objects, the first representing the "up"
+// block and the second representing the "down" block. This function
+// requires that at least an up block was defined and will otherwise
+// return an error.
+func parseSeedContents(contents string) (Seed, Seed, error) {
+	up := NewSeed()
+	down := NewSeed()
+
+	upDirectiveStart, upDirectiveEnd, hasDefinedUpBlock := getMatchPositions(contents, seedUpRegExp)
+	downDirectiveStart, downDirectiveEnd, hasDefinedDownBlock := getMatchPositions(contents, seedDownRegExp)
+
+	if !hasDefinedUpBlock {
+		return up, down, fmt.Errorf("dbmate requires each seed to define an up bock with '-- seed:up'")
+	} else if statementsPrecedeSeedBlocks(contents, upDirectiveStart, downDirectiveStart) {
+		return up, down, fmt.Errorf("dbmate does not support statements defined outside of the '-- seed:up' or '-- seed:down' blocks")
 	}
 
 	upEnd := len(contents)
@@ -102,7 +173,7 @@ func parseMigrationOptions(contents string) MigrationOptions {
 	options := make(migrationOptions)
 
 	// strip away the -- migrate:[up|down] part
-	contents = blockDirectiveRegExp.ReplaceAllString(contents, "")
+	contents = migrationBlockDirectiveRegExp.ReplaceAllString(contents, "")
 
 	// remove leading and trailing whitespace
 	contents = strings.TrimSpace(contents)
@@ -128,6 +199,45 @@ func parseMigrationOptions(contents string) MigrationOptions {
 	return options
 }
 
+// parseSeedOptions parses the seed options out of a block
+// directive into an object that implements the SeedOptions interface.
+//
+// For example:
+//
+//     fmt.Printf("%#v", parseSeedOptions("-- migrate:up transaction:false"))
+//     // seedOptions{"transaction": "false"}
+//
+func parseSeedOptions(contents string) SeedOptions {
+	options := make(seedOptions)
+
+	// strip away the -- seed:[up|down] part
+	contents = seedBlockDirectiveRegExp.ReplaceAllString(contents, "")
+
+	// remove leading and trailing whitespace
+	contents = strings.TrimSpace(contents)
+
+	// return empty options if nothing is left to parse
+	if contents == "" {
+		return options
+	}
+
+	// split the options string into pairs, e.g. "transaction:false foo:bar" -> []string{"transaction:false", "foo:bar"}
+	stringPairs := whitespaceRegExp.Split(contents, -1)
+
+	for _, stringPair := range stringPairs {
+		// split stringified pair into key and value pairs, e.g. "transaction:false" -> []string{"transaction", "false"}
+		pair := optionSeparatorRegExp.Split(stringPair, -1)
+
+		// if the syntax is well-formed, then store the key and value pair in options
+		if len(pair) == 2 {
+			options[pair[0]] = pair[1]
+		}
+	}
+
+	return options
+}
+
+
 // statementsPrecedeMigrateBlocks inspects the contents between the first character
 // of a string and the index of the first block directive to see if there are any statements
 // defined outside of the block directive. It'll return true if it finds any such statements.
@@ -148,6 +258,25 @@ func parseMigrationOptions(contents string) MigrationOptions {
 // `, 54, -1)
 //
 func statementsPrecedeMigrateBlocks(contents string, upDirectiveStart, downDirectiveStart int) bool {
+	until := upDirectiveStart
+
+	if downDirectiveStart > -1 {
+		until = min(upDirectiveStart, downDirectiveStart)
+	}
+
+	lines := strings.Split(contents[0:until], "\n")
+
+	for _, line := range lines {
+		if isEmptyLine(line) || isCommentLine(line) {
+			continue
+		}
+		return true
+	}
+
+	return false
+}
+
+func statementsPrecedeSeedBlocks(contents string, upDirectiveStart, downDirectiveStart int) bool {
 	until := upDirectiveStart
 
 	if downDirectiveStart > -1 {
